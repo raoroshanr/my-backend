@@ -1,106 +1,63 @@
-import os
-import ee
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from contextlib import asynccontextmanager
-
-# Track if Earth Engine logged in successfully
-gee_status = "Not Initialized"
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global gee_status
-    try:
-        # Step 1: Read the secret variables from Google Cloud Run
-        gee_key_string = os.environ.get("GEE_JSON_KEY")
-        project_id = os.environ.get("GCP_PROJECT_ID")
-        
-        if not gee_key_string:
-            gee_status = "Error: GEE_JSON_KEY environment variable is missing"
-        else:
-            # Step 2: Pass the raw string directly to Earth Engine
-            auth = ee.ServiceAccountCredentials(None, key_data=gee_key_string)
-            ee.Initialize(credentials=auth, project=project_id)
-            
-            gee_status = "Success"
-            print("Earth Engine Initialized Successfully!")
-            
-    except Exception as e:
-        gee_status = f"Failed to initialize Earth Engine: {str(e)}"
-        print(gee_status)
-    yield
-
-# Start FastAPI with our safe lifespan function
-app = FastAPI(lifespan=lifespan)
-
-# Allow your Netlify frontend to communicate with this backend securely
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], 
-    allow_credentials=True,
-    allow_methods=["*"], 
-    allow_headers=["*"],
-)
-
-# Diagnostic homepage
-@app.get("/")
-def health_check():
-    return {
-        "server_status": "Server is running perfectly!", 
-        "earth_engine_status": gee_status
-    }
-
-# The endpoint your mobile app talks to
 @app.get("/api/map-tiles")
 def get_map_tiles(product: str = 'POP', epoch: str = '2020', region: str = 'All'):
     if gee_status != "Success":
         return {"error": gee_status}
     
     try:
-        # 1. Select the Dataset and the matching Color Palette
-        if product == 'POP':
-            # Population Density (Black -> Blue -> Cyan -> Green -> Yellow -> Red)
-            dataset = ee.ImageCollection("JRC/GHSL/P2023A/GHS_POP")
-            vis_params = {'min': 0.0, 'max': 100.0, 'palette': ['000004', '3b0f70', '8c2981', 'de4968', 'fe9f6d', 'fcfdbf']}
+        # --- SMART ROUTER ---
+        # 1. Standard Time-Series Datasets
+        if product in ['POP', 'BUILT_S', 'BUILT_V', 'SMOD']:
             
-        elif product == 'BUILT_S':
-            # Built-Up Surface / Concrete (Black -> White)
-            dataset = ee.ImageCollection("JRC/GHSL/P2023A/GHS_BUILT_S")
-            vis_params = {'min': 0.0, 'max': 100.0, 'palette': ['000000', '444444', '999999', 'FFFFFF']}
+            if product == 'POP':
+                dataset = ee.ImageCollection("JRC/GHSL/P2023A/GHS_POP")
+                vis_params = {'min': 0.0, 'max': 100.0, 'palette': ['000004', '3b0f70', '8c2981', 'de4968', 'fe9f6d', 'fcfdbf']}
+            elif product == 'BUILT_S':
+                dataset = ee.ImageCollection("JRC/GHSL/P2023A/GHS_BUILT_S")
+                vis_params = {'min': 0.0, 'max': 100.0, 'palette': ['000000', '444444', '999999', 'FFFFFF']}
+            elif product == 'BUILT_V':
+                dataset = ee.ImageCollection("JRC/GHSL/P2023A/GHS_BUILT_V")
+                vis_params = {'min': 0.0, 'max': 50.0, 'palette': ['000000', '004400', '00AA00', '00FF00']}
+            elif product == 'SMOD':
+                dataset = ee.ImageCollection("JRC/GHSL/P2023A/GHS_SMOD")
+                vis_params = {'min': 10.0, 'max': 30.0, 'palette': ['0000AA', '004400', 'FFFF00', 'FF0000']}
+
+            # Filter Collection by Year
+            start_date = f"{epoch}-01-01"
+            end_date = f"{epoch}-12-31"
+            image = dataset.filterDate(start_date, end_date).first()
+
+        # 2. Single-Snapshot Datasets (e.g., 2018 Building Heights)
+        elif product == 'BUILT_H':
+            # Note: We load this directly as a single Image, no date filtering required!
+            image = ee.Image("JRC/GHSL/P2023A/GHS_BUILT_H/2018")
+            vis_params = {'min': 0.0, 'max': 30.0, 'palette': ['000000', '0000FF', 'FF0000', 'FFFF00']}
+
+        # 3. Massive Vector Datasets (e.g., OBAT Building Footprints)
+        elif product == 'OBAT':
+            # Load from the community catalog (Vector FeatureCollection)
+            vector_data = ee.FeatureCollection("projects/sat-io/open-datasets/ghs-obat")
             
-        elif product == 'BUILT_V':
-            # Building Volume / 3D Height Proxy (Black -> Dark Green -> Light Green)
-            dataset = ee.ImageCollection("JRC/GHSL/P2023A/GHS_BUILT_V")
-            vis_params = {'min': 0.0, 'max': 50.0, 'palette': ['000000', '004400', '00AA00', '00FF00']}
-            
-        elif product == 'SMOD':
-            # Settlement Model / Degree of Urbanization (Categorical Classes)
-            dataset = ee.ImageCollection("JRC/GHSL/P2023A/GHS_SMOD")
-            # 10=Water, 11=Very Rural, 21=Suburban, 30=Urban Center
-            vis_params = {'min': 10.0, 'max': 30.0, 'palette': ['0000AA', '004400', 'FFFF00', 'FF0000']}
-            
+            # Server-Side Rasterization: We tell Google to paint the polygons into pixels!
+            # We color them solid cyan with a dark blue outline
+            image = vector_data.style(**{
+                'color': '000055',
+                'width': 1,
+                'fillColor': '00FFFF'
+            })
+            # Style() returns an RGB image, so we don't need min/max/palette vis_params
+            vis_params = {}
+
         else:
             return {"error": "Invalid product selected"}
 
-        # 2. Filter by the specific year (Epoch) requested by the frontend
-        start_date = f"{epoch}-01-01"
-        end_date = f"{epoch}-12-31"
-        image = dataset.filterDate(start_date, end_date).first()
-
-        # 3. Handle Boundary Clipping (Cookie Cutter Masking)
+        # --- BOUNDARY CLIPPING ---
         if region != 'All':
-            # Load FAO GAUL Second-Level Administrative Units (Districts)
             boundaries = ee.FeatureCollection("FAO/GAUL/2015/level2")
-            
-            # Filter the database to find the exact matching district boundary name
             selected_boundary = boundaries.filter(ee.Filter.eq('ADM2_NAME', region))
-            
-            # Clip the planetary raster down to just this administrative boundary shape
             image = image.clipToCollection(selected_boundary)
 
-        # 4. Request the temporary map tile URL from Google
+        # --- FETCH URL ---
         map_id_dict = ee.Image(image).getMapId(vis_params)
-        
         return {"tile_url": map_id_dict['tile_fetcher'].url_format}
         
     except Exception as e:
