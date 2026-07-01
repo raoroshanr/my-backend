@@ -1,65 +1,35 @@
-import os
-import ee
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from contextlib import asynccontextmanager
-
-# Track if Earth Engine logged in successfully
-gee_status = "Not Initialized"
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global gee_status
-    try:
-        # Step 1: Read the secret variables from Google Cloud
-        gee_key_string = os.environ.get("GEE_JSON_KEY")
-        project_id = os.environ.get("GCP_PROJECT_ID")
-        
-        if not gee_key_string:
-            gee_status = "Error: GEE_JSON_KEY environment variable is missing"
-        else:
-            # Step 2: Pass the raw string directly to Earth Engine (No json.loads needed!)
-            auth = ee.ServiceAccountCredentials(None, key_data=gee_key_string)
-            ee.Initialize(credentials=auth, project=project_id)
-            
-            gee_status = "Success"
-            print("Earth Engine Initialized Successfully!")
-            
-    except Exception as e:
-        gee_status = f"Failed to initialize Earth Engine: {str(e)}"
-        print(gee_status)
-    yield
-
-# Start FastAPI with our safe lifespan function
-app = FastAPI(lifespan=lifespan)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], 
-    allow_credentials=True,
-    allow_methods=["*"], 
-    allow_headers=["*"],
-)
-
-# Your diagnostic homepage
-@app.get("/")
-def health_check():
-    return {
-        "server_status": "Server is running perfectly!", 
-        "earth_engine_status": gee_status
-    }
-
-# The endpoint Netlify will talk to
 @app.get("/api/map-tiles")
-def get_map_tiles():
+def get_map_tiles(product: str = 'POP', epoch: str = '2020'):
     if gee_status != "Success":
         return {"error": gee_status}
     
     try:
-        image = ee.Image('USGS/SRTMGL1_003')
-        vis_params = {'min': 0, 'max': 3000, 'palette': ['blue', 'green', 'red']}
+        # 1. Select the correct GHSL Dataset based on the dropdown
+        if product == 'POP':
+            # Global Population Density
+            dataset = ee.ImageCollection("JRC/GHSL/P2023A/GHS_POP")
+            # Black to Blue to Red heatmap
+            vis_params = {'min': 0.0, 'max': 100.0, 'palette': ['000000', '0000FF', '00FFFF', '00FF00', 'FFFF00', 'FF0000']}
+        
+        elif product == 'BUILT_S':
+            # Built-Up Surface Area (Buildings/Concrete)
+            dataset = ee.ImageCollection("JRC/GHSL/P2023A/GHS_BUILT_S")
+            # Black to White grayscale
+            vis_params = {'min': 0.0, 'max': 100.0, 'palette': ['000000', '333333', '999999', 'FFFFFF']}
+            
+        else:
+            return {"error": "Invalid product selected"}
+
+        # 2. Filter the dataset to find the exact epoch (year) requested
+        # We look for any image published within that specific year
+        start_date = f"{epoch}-01-01"
+        end_date = f"{epoch}-12-31"
+        image = dataset.filterDate(start_date, end_date).first()
+
+        # 3. Generate the map tile URL
         map_id_dict = ee.Image(image).getMapId(vis_params)
         
         return {"tile_url": map_id_dict['tile_fetcher'].url_format}
+        
     except Exception as e:
         return {"error": str(e)}
