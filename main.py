@@ -42,7 +42,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Diagnostic homepage (What you see when you visit the Cloud Run URL directly)
+# Diagnostic homepage
 @app.get("/")
 def health_check():
     return {
@@ -52,7 +52,7 @@ def health_check():
 
 # The endpoint your mobile app talks to
 @app.get("/api/map-tiles")
-def get_map_tiles(product: str = 'POP', epoch: str = '2020'):
+def get_map_tiles(product: str = 'POP', epoch: str = '2020', region: str = 'All'):
     if gee_status != "Success":
         return {"error": gee_status}
     
@@ -85,11 +85,20 @@ def get_map_tiles(product: str = 'POP', epoch: str = '2020'):
         # 2. Filter by the specific year (Epoch) requested by the frontend
         start_date = f"{epoch}-01-01"
         end_date = f"{epoch}-12-31"
-        
-        # We use .first() because GHSL releases one global mosaic per year
         image = dataset.filterDate(start_date, end_date).first()
 
-        # 3. Request the temporary map tile URL from Google
+        # 3. Handle Boundary Clipping (Cookie Cutter Masking)
+        if region != 'All':
+            # Load FAO GAUL Second-Level Administrative Units (Districts)
+            boundaries = ee.FeatureCollection("FAO/GAUL/2015/level2")
+            
+            # Filter the database to find the exact matching district boundary name
+            selected_boundary = boundaries.filter(ee.Filter.eq('ADM2_NAME', region))
+            
+            # Clip the planetary raster down to just this administrative boundary shape
+            image = image.clipToCollection(selected_boundary)
+
+        # 4. Request the temporary map tile URL from Google
         map_id_dict = ee.Image(image).getMapId(vis_params)
         
         return {"tile_url": map_id_dict['tile_fetcher'].url_format}
